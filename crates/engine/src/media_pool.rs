@@ -374,14 +374,32 @@ impl MediaPool {
         }
         match self.follow_media(path).and_then(|file| self.open_file(&file, services)) {
             Ok(s) => {
-                // a proxy with fewer audio streams than the original (say one track of an OBS
-                // recording's seven) still stands in for the picture; the audio comes from the
-                // original, so every clip keeps the stream it plays
-                let audio_from = if s.info().audio_streams.len() < m.info.audio_streams.len() {
-                    log::warn!("proxy has fewer audio streams than the original: {path}; audio from full-resolution media");
+                // Keep proxy pictures, but read original audio if any corresponding stream
+                // is absent or has fewer channels (for example an eight-channel camera source
+                // and a stereo proxy, both exposing just one stream).
+                let needs_original_audio = m
+                    .info
+                    .audio_streams
+                    .iter()
+                    .enumerate()
+                    .any(|(index, original)| s.info().audio_streams.get(index).is_none_or(|proxy| proxy.channels < original.channels));
+                let audio_from = if needs_original_audio {
+                    log::warn!("proxy has fewer audio streams or channels than the original: {path}; audio from full-resolution media");
                     match &m.media {
-                        MediaRef::File { path: original } if !m.offline => self.follow_media(original).and_then(|file| self.open_file(&file, services)).ok(),
-                        _ => None,
+                        MediaRef::File { path: original } if !m.offline => match self.follow_media(original).and_then(|file| self.open_file(&file, services)) {
+                            Ok(original) => Some(original),
+                            Err(e) => {
+                                // Do not advertise channels the proxy cannot supply. Let normal
+                                // resolution expose the unavailable original's offline state.
+                                log::warn!("proxy requires unavailable original audio: {original}: {e}");
+                                return None;
+                            }
+                        },
+                        MediaRef::Generator(g) => {
+                            let (w, h, rate) = m.info.video.as_ref().map(|v| (v.width, v.height, v.frame_rate)).unwrap_or((1920, 1080, Default::default()));
+                            Some(Arc::new(GeneratorSource::new(g.clone(), w, h, rate, m.info.duration).with_name(&m.info.name)) as SharedSource)
+                        }
+                        _ => return None,
                     }
                 } else {
                     None
@@ -592,7 +610,7 @@ impl MediaSource for DamagedAsSlate {
 pub struct ProxySource {
     pub proxy: SharedSource,
     pub info: MediaInfo,
-    /// Where audio comes from when the proxy has fewer audio streams than the original.
+    /// Where audio comes from when the proxy lacks original streams or channels.
     pub audio_from: Option<SharedSource>,
 }
 
@@ -633,6 +651,85 @@ impl MediaSource for ProxySource {
 mod tests {
     use super::*;
     use filmcraft_project::ItemKind;
+
+    struct ProxyAudioFiles {
+        original: Vec<u8>,
+        proxy: Vec<u8>,
+        original_missing: bool,
+    }
+    impl Services for ProxyAudioFiles {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            match path {
+                "original.wav" if !self.original_missing => Ok(self.original.clone()),
+                "proxy.wav" => Ok(self.proxy.clone()),
+                _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "test original unavailable")),
+            }
+        }
+        fn write_file(&self, _: &str, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn proxy_audio_fixture(proxy_channels: u16) -> (MediaPool, MediaClip, ProxyAudioFiles) {
+        // Every channel has distinct, non-silent samples; zeros cannot hide a lost channel.
+        let samples: Vec<f32> = (0..128).flat_map(|frame| (0..8).map(move |ch| (ch + 1) as f32 * 0.05 + frame as f32 * 0.0001)).collect();
+        let services = ProxyAudioFiles {
+            original: filmcraft_media::wav::write_wav16(&samples, 8, 48_000),
+            proxy: filmcraft_media::wav::write_wav16(&vec![0.01; 128 * proxy_channels as usize], proxy_channels, 48_000),
+            original_missing: false,
+        };
+        let pool = MediaPool::default();
+        let info = pool.open_file("original.wav", &services).unwrap().info().clone();
+        let m = MediaClip {
+            media: MediaRef::File { path: "original.wav".into() },
+            info,
+            interpret: Default::default(),
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            offline: false,
+            proxy: Some(MediaRef::File { path: "proxy.wav".into() }),
+            identity: None,
+        };
+        (pool, m, services)
+    }
+
+    #[test]
+    fn proxy_with_fewer_channels_keeps_every_original_sample() {
+        let (pool, m, services) = proxy_audio_fixture(2);
+        let original = pool.open_file("original.wav", &services).unwrap();
+        let proxy = pool.proxy_source(ItemId(1), "proxy.wav", &m, &services).unwrap();
+        assert_eq!(proxy.info().audio_streams.len(), 1);
+        assert_eq!(proxy.info().audio().unwrap().channels, 8);
+        for start in [0, 47] {
+            let expected = original.audio(start, 32, 48_000).unwrap();
+            for actual in [proxy.audio(start, 32, 48_000).unwrap(), proxy.audio_stream(0, start, 32, 48_000).unwrap()] {
+                assert_eq!(actual.channels, expected.channels, "all eight channels retain exact samples and order");
+                assert_eq!(actual.channels.len(), 8);
+            }
+        }
+        assert!(proxy.audio_stream(1, 0, 32, 48_000).is_err());
+        let cached = pool.proxy_source(ItemId(1), "proxy.wav", &m, &services).unwrap();
+        assert!(Arc::ptr_eq(&proxy, &cached));
+    }
+
+    #[test]
+    fn proxy_with_matching_channels_still_supplies_its_own_audio() {
+        let (pool, m, services) = proxy_audio_fixture(8);
+        let raw_proxy = pool.open_file("proxy.wav", &services).unwrap();
+        let proxy = pool.proxy_source(ItemId(1), "proxy.wav", &m, &services).unwrap();
+        assert_eq!(proxy.audio(0, 32, 48_000).unwrap().channels, raw_proxy.audio(0, 32, 48_000).unwrap().channels);
+    }
+
+    #[test]
+    fn incomplete_proxy_does_not_hide_an_unavailable_original() {
+        let (pool, m, mut services) = proxy_audio_fixture(2);
+        services.original_missing = true;
+        assert!(
+            pool.proxy_source(ItemId(1), "proxy.wav", &m, &services).is_none(),
+            "normal resolution must expose the offline original instead of silently losing channels"
+        );
+    }
 
     /// A host whose whole-file read fails: opening must go through the reader.
     struct ReaderOnly(Arc<[u8]>);
