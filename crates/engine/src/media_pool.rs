@@ -49,7 +49,7 @@ pub struct OfflineMedia {
 pub struct MediaPool {
     /// item → (reference key, source)
     sources: RwLock<HashMap<ItemId, (String, SharedSource)>>,
-    proxies: RwLock<HashMap<ItemId, (String, SharedSource)>>,
+    proxies: RwLock<HashMap<ItemId, ProxyDecision>>,
     offline: Arc<RwLock<HashMap<ItemId, OfflineStatus>>>,
     use_proxies: AtomicBool,
     /// Per item: video frames that failed in a row in the monitors (see [`Self::monitor_source`]).
@@ -59,6 +59,16 @@ pub struct MediaPool {
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
     stored: RwLock<HashMap<String, Option<PathBuf>>>,
+}
+
+/// A proxy decision depends on the original as well as the proxy path. A missing required
+/// original is a cached decision, not an opened source; refresh/relink drops it for a retry.
+struct ProxyDecision {
+    path: String,
+    original: MediaRef,
+    offline: bool,
+    info: MediaInfo,
+    source: Option<SharedSource>,
 }
 
 impl Default for MediaPool {
@@ -152,16 +162,19 @@ impl MediaPool {
 
     /// Cache a source for an item, valid whatever the item's reference (generators).
     pub fn insert(&self, item: ItemId, src: SharedSource) {
+        self.proxies.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (String::new(), src));
     }
 
     /// Cache a source for an item under its [`media_key`].
     pub fn insert_keyed(&self, item: ItemId, key: String, src: SharedSource) {
+        self.proxies.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (key, src));
     }
 
     /// Cache a source opened from `path` for an item.
     pub fn insert_file(&self, item: ItemId, path: &str, src: SharedSource) {
+        self.proxies.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
         self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
         let src = self.unsupported_as_slate(item, path, src);
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (format!("file:{path}"), src));
@@ -241,7 +254,8 @@ impl MediaPool {
 
     /// Sources opened so far (originals and proxies; `perf.stats`).
     pub fn open_sources(&self) -> usize {
-        self.sources.read().unwrap_or_else(|e| e.into_inner()).len() + self.proxies.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.sources.read().unwrap_or_else(|e| e.into_inner()).len()
+            + self.proxies.read().unwrap_or_else(|e| e.into_inner()).values().filter(|entry| entry.source.is_some()).count()
     }
 
     pub fn use_proxies(&self) -> bool {
@@ -366,11 +380,13 @@ impl MediaPool {
     }
 
     fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: &dyn Services) -> Option<SharedSource> {
-        let key = format!("proxy:{path}");
-        if let Some((k, s)) = self.proxies.read().unwrap_or_else(|e| e.into_inner()).get(&item)
-            && *k == key
+        if let Some(entry) = self.proxies.read().unwrap_or_else(|e| e.into_inner()).get(&item)
+            && entry.path == path
+            && entry.original == m.media
+            && entry.offline == m.offline
+            && entry.info == m.info
         {
-            return Some(s.clone());
+            return entry.source.clone();
         }
         match self.follow_media(path).and_then(|file| self.open_file(&file, services)) {
             Ok(s) => {
@@ -392,7 +408,7 @@ impl MediaPool {
                                 // Do not advertise channels the proxy cannot supply. Let normal
                                 // resolution expose the unavailable original's offline state.
                                 log::warn!("proxy requires unavailable original audio: {original}: {e}");
-                                return None;
+                                return self.remember_proxy(item, path, m, None);
                             }
                         },
                         MediaRef::Generator(g) => {
@@ -405,8 +421,7 @@ impl MediaPool {
                     None
                 };
                 let src: SharedSource = Arc::new(ProxySource { proxy: s, info: m.info.clone(), audio_from });
-                self.proxies.write().unwrap_or_else(|e| e.into_inner()).insert(item, (key, src.clone()));
-                Some(src)
+                self.remember_proxy(item, path, m, Some(src))
             }
             Err(e) => {
                 // a missing proxy falls back to the full-resolution media
@@ -414,6 +429,16 @@ impl MediaPool {
                 None
             }
         }
+    }
+
+    /// Remember a completed proxy decision. Deferred web reads must retry when bytes arrive;
+    /// a proxy file that itself cannot open retains its existing retry behavior.
+    fn remember_proxy(&self, item: ItemId, path: &str, m: &MediaClip, source: Option<SharedSource>) -> Option<SharedSource> {
+        if source.is_some() || !filmcraft_media::pending::is_set() {
+            let entry = ProxyDecision { path: path.into(), original: m.media.clone(), offline: m.offline, info: m.info.clone(), source: source.clone() };
+            self.proxies.write().unwrap_or_else(|e| e.into_inner()).insert(item, entry);
+        }
+        source
     }
 
     /// A render-side provider bound to a project snapshot (proxies when enabled).
@@ -1000,3 +1025,7 @@ mod tests {
         assert!(st.error.contains("H.264") && st.error.contains("chroma_format_idc 3"), "{}", st.error);
     }
 }
+
+#[cfg(test)]
+#[path = "proxy_cache_tests.rs"]
+mod proxy_cache_tests;
