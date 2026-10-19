@@ -65,3 +65,8 @@ in-flight jobs may hold it until they finish. Dropping the server therefore rele
 picture snapshots instead of leaving the new cache pinned by detached idle workers. The lifetime
 regression observes the actual project snapshot through a weak reference after dropping the app;
 it fails before this ownership correction. General worker-thread shutdown is outside this change.
+
+Metadata burn-in may read sequence names outside the immutable sequence payload, including
+shared aliases. Such pictures invalidate conservatively when the project snapshot changes; the
+cache does not infer complete dependency identity from a sequence pointer alone. Item names and
+bounded effect inspection participate in the same validation used by thumbnails.

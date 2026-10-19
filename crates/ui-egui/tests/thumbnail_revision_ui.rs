@@ -387,3 +387,29 @@ fn more_sequence_cards_than_memo_slots_do_not_regenerate_while_idle() {
     let changed: Vec<_> = ids.iter().map(|id| app.item_revision(*id)).collect();
     assert_ne!(changed.last(), before.last(), "uncached overflow still invalidates on a new project snapshot");
 }
+
+#[test]
+fn oversized_name_and_effect_metadata_use_conservative_keys() {
+    for large_name in [true, false] {
+        let (mut app, inner, outer, _) = fixture();
+        app.session
+            .edit("large metadata", |p, _| {
+                if large_name {
+                    p.item_mut(inner).unwrap().name = "n".repeat(4097);
+                } else {
+                    p.sequence_mut(inner).unwrap().video_tracks[0].items[0].effects =
+                        vec![filmcraft_project::effect::find_effect("motion").unwrap().instance(); 4097];
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = app.item_revision(inner);
+        app.session
+            .edit("outer edit", |p, _| {
+                p.sequence_mut(outer).unwrap().video_tracks[0].items[0].enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        assert_ne!(app.item_revision(inner), before, "oversized comparison metadata must not gain optimistic reuse");
+    }
+}

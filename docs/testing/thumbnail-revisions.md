@@ -8,8 +8,8 @@ thumbnails reusable; changes inside the inner sequence still refresh them.
 The memo retains at most eight project snapshot references (not decoded pictures or media
 sources). It compares shared sequence identities and reachable media/subclip/graphic items,
 including nested and merged references, plus project settings, lookup tables and source graphics.
-A comparison visits at most 256 dependency nodes, 1,024 track/clip references and 32 nesting
-levels. Missing items, cycles and limit overflows invalidate conservatively on a new snapshot.
+A comparison visits at most 256 dependency nodes, 1,024 track/clip references, 4,096 effect entries
+and 32 nesting levels. Item names over 4,096 bytes invalidate conservatively. Missing items, cycles and limit overflows invalidate conservatively on a new snapshot.
 An unchanged snapshot/context uses the memo without another dependency walk. Large projects
 may therefore retain the previous behavior rather than gain cache reuse. Once the eight memo
 slots are occupied, further cards use a shared conservative identity tied to the current project
@@ -39,3 +39,11 @@ with repeated baseline runs. Keep frame-job work separate from command-to-curren
 and physical presentation. Fewer redundant jobs do not by themselves establish an end-to-end
 speed gain or qualify every nested workload. No private recording or screenshot belongs in this
 source contribution.
+
+
+Project item names are picture inputs: Metadata & Timecode Burn-in can render a sequence's name,
+which lives outside its shared sequence data. A name change therefore invalidates the picture.
+Burn-in also resolves shared-sequence aliases through a project-level name lookup. To avoid an
+unbounded whole-project alias scan, reachable burn-in effects retain conservative invalidation
+across changed snapshots; unchanged contexts remain stable. Tests verify both actual Program
+pixels and thumbnail identities after ordinary and shared-alias sequence renames.

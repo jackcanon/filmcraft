@@ -306,3 +306,62 @@ fn dropping_a_frame_server_releases_its_retained_inner_picture_snapshot() {
     drop(app);
     eventually("idle frame workers retained the completed inner-picture snapshot after its owner was dropped", || project.upgrade().is_none());
 }
+
+fn metadata_fixture(alias: bool) -> (FilmcraftApp, ItemId, ItemId, ItemId) {
+    let (mut app, inner, outer, _) = fixture();
+    let mut rendered_inner = inner;
+    app.session
+        .edit("sequence-name burn-in", |p, _| {
+            let mut e = filmcraft_project::effect::find_effect("metadata_burnin").unwrap().instance();
+            e.param_mut("source").unwrap().value = ParamValue::Choice(5);
+            e.param_mut("size").unwrap().value = ParamValue::Float(40.0);
+            p.sequence_mut(inner).unwrap().video_tracks[0].items[0].effects.push(e);
+            p.item_mut(inner).unwrap().name = "AAA".into();
+            if alias {
+                let kind = p.item(inner).unwrap().kind.clone();
+                rendered_inner = p.add_item("alias", Label::Iris, kind, None);
+                p.sequence_mut(outer).unwrap().video_tracks[0].items[0].item = rendered_inner;
+            }
+            Ok(())
+        })
+        .unwrap();
+    (app, inner, outer, rendered_inner)
+}
+fn rename_metadata_source(app: &mut FilmcraftApp, inner: ItemId) {
+    app.session
+        .edit("rename visible metadata", |p, _| {
+            p.item_mut(inner).unwrap().name = "WWW".into();
+            Ok(())
+        })
+        .unwrap();
+}
+#[test]
+fn metadata_sequence_name_refreshes_the_actual_cached_program_picture() {
+    let (mut app, inner, outer, _) = metadata_fixture(false);
+    let before = pixels_match_reference(&app, outer, &plan(&app, outer));
+    rename_metadata_source(&mut app, inner);
+    let after = pixels_match_reference(&app, outer, &plan(&app, outer));
+    assert_ne!(before.px, after.px, "renamed metadata must visibly change the picture");
+}
+#[test]
+fn metadata_sequence_name_refreshes_the_thumbnail_identity() {
+    let (mut app, inner, _, rendered) = metadata_fixture(false);
+    let old = app.item_revision(rendered);
+    rename_metadata_source(&mut app, inner);
+    assert_ne!(app.item_revision(rendered), old, "rendered sequence name changed outside the sequence Arc");
+}
+#[test]
+fn metadata_sequence_name_alias_refreshes_the_actual_cached_program_picture() {
+    let (mut app, inner, outer, _) = metadata_fixture(true);
+    let before = pixels_match_reference(&app, outer, &plan(&app, outer));
+    rename_metadata_source(&mut app, inner);
+    let after = pixels_match_reference(&app, outer, &plan(&app, outer));
+    assert_ne!(before.px, after.px, "shared-sequence metadata origin must visibly change");
+}
+#[test]
+fn metadata_sequence_name_alias_refreshes_the_thumbnail_identity() {
+    let (mut app, inner, _, rendered) = metadata_fixture(true);
+    let old = app.item_revision(rendered);
+    rename_metadata_source(&mut app, inner);
+    assert_ne!(app.item_revision(rendered), old, "global first-sequence name lookup changed outside the reachable item");
+}

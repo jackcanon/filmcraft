@@ -12,6 +12,8 @@ const ENTRIES: usize = 8;
 const NODES: usize = 256;
 const EDGES: usize = 1024;
 const DEPTH: usize = 32;
+const EFFECTS: usize = 4096;
+const NAME_BYTES: usize = 4096;
 
 struct Entry {
     item: ItemId,
@@ -104,6 +106,7 @@ pub(crate) fn dependencies_unchanged(old: &Project, new: &Project, root: ItemId)
     let mut active = HashSet::new();
     let mut done = HashSet::new();
     let mut edges = 0usize;
+    let mut effects = 0usize;
     while let Some((id, depth, leave)) = stack.pop() {
         if leave {
             active.remove(&id);
@@ -122,6 +125,10 @@ pub(crate) fn dependencies_unchanged(old: &Project, new: &Project, root: ItemId)
         let (Some(a), Some(b)) = (old.item(id), new.item(id)) else {
             return false;
         };
+        // Names can be burned into the picture even though they live outside Sequence data.
+        if a.name.len() > NAME_BYTES || b.name.len() > NAME_BYTES || a.name != b.name {
+            return false;
+        }
         active.insert(id);
         stack.push((id, depth, true));
         match (&a.kind, &b.kind) {
@@ -135,6 +142,13 @@ pub(crate) fn dependencies_unchanged(old: &Project, new: &Project, root: ItemId)
                         return false;
                     }
                     for clip in &track.items {
+                        effects = effects.saturating_add(clip.effects.len());
+                        // Burn-in's sequence-name lookup may resolve a shared Sequence through
+                        // another project item, outside this graph. Keep it conservative across
+                        // snapshots rather than scanning the whole project for aliases.
+                        if effects > EFFECTS || clip.effects.iter().any(|e| e.effect == "metadata_burnin") {
+                            return false;
+                        }
                         stack.push((clip.item, depth + 1, false));
                     }
                 }
