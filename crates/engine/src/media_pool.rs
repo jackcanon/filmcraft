@@ -861,6 +861,53 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn decoded_audio_is_accounted_evicted_and_reopened_without_sample_changes() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-audio-residency-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let samples: Vec<f32> = (0..4096).flat_map(|n| [((n + i * 19) % 128) as f32 / 256.0, -((n + i * 7) % 64) as f32 / 128.0]).collect();
+            let path = dir.join(format!("audio{i}.aiff"));
+            let data = filmcraft_export::write_aiff(&samples, 2, 48_000, filmcraft_export::SampleFormat::Int16).unwrap();
+            std::fs::write(&path, data).unwrap();
+            paths.push(path.to_string_lossy().to_string());
+        }
+        let mut session = crate::Session::default();
+        session.execute("file.import", serde_json::json!({"paths": paths})).unwrap();
+        let project = session.project.clone();
+        drop(session);
+        let mut items: Vec<_> = project.items.values().filter(|i| i.name.starts_with("audio")).map(|i| i.id).collect();
+        items.sort_by_key(|i| project.item(*i).unwrap().name.clone());
+        assert_eq!(items.len(), 6);
+        let pool = MediaPool::default();
+        let held = pool.source_for(&project, items[0], &crate::FsServices).unwrap();
+        let one = held.resident_bytes();
+        assert!(one >= 4096 * 2 * 4, "standalone decoded samples must count against the budget");
+        let expected = held.audio(137, 256, 48_000).unwrap().channels;
+        pool.set_resident_budget(2 * one);
+        for item in &items {
+            let source = pool.source_for(&project, *item, &crate::FsServices).unwrap();
+            assert_eq!(source.audio(137, 256, 48_000).unwrap().channels.len(), 2);
+            assert!(pool.resident_bytes() <= 2 * one);
+        }
+        assert_eq!(pool.open_sources(), 2);
+        assert!(pool.cached(items[0]).is_none());
+        let reopened = pool.source_for(&project, items[0], &crate::FsServices).unwrap();
+        assert_eq!(reopened.audio(137, 256, 48_000).unwrap().channels, expected);
+        assert!(pool.cached(items[5]).is_some() && pool.cached(items[4]).is_none(), "least recent source makes room");
+        pool.set_resident_budget(0);
+        assert_eq!(pool.resident_bytes(), 0);
+        assert_eq!(pool.open_sources(), 0);
+        // Evicting the pool's ownership must not invalidate a playing source's sample buffer.
+        assert_eq!(held.audio(137, 256, 48_000).unwrap().channels, expected);
+        assert_eq!(reopened.audio(137, 256, 48_000).unwrap().channels, expected);
+        let oversized = pool.source_for(&project, items[1], &crate::FsServices).unwrap();
+        assert_eq!(pool.open_sources(), 1, "the current source is retained even above budget");
+        assert_eq!(oversized.audio(4000, 192, 48_000).unwrap().channels.len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A file whose first frame decodes and whose later frames need a decoder FilmCraft lacks.
     struct PartlyDecodable(MediaInfo);
     impl MediaSource for PartlyDecodable {
