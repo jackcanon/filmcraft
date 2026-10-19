@@ -433,8 +433,19 @@ fn push_item(
             let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
             let (w, h) = output_size(nested, want);
             // Reject oversized copies before rendering, so the fallback does not render twice.
+            let request = crate::NestedPictureRequest {
+                sequence: item.item,
+                time: ft,
+                scale_bits: want.to_bits(),
+                effects: opts.effects,
+                depth: opts.depth.saturating_add(1),
+            };
             if nest_border_size(w, h).is_some()
-                && let Some(img) = crate::base_layer(project, seq, item, t, opts, sources, want)
+                && let Some(img) = sources.nested_picture(request).or_else(|| {
+                    let img = Arc::new(crate::base_layer(project, seq, item, t, opts, sources, want)?);
+                    sources.retain_nested_picture(request, img.clone());
+                    Some(img)
+                })
             {
                 let px_scale = img.w as f64 / size.0.max(1) as f64;
                 let mut matrix =
@@ -443,7 +454,7 @@ fn push_item(
                 // Exactly the reference Image::transformed mip choice, bounded by halving.
                 let minify = |m: &Affine| 1.0 / (m.a * m.a + m.b * m.b).sqrt().min((m.c * m.c + m.d * m.d).sqrt()).max(1e-6);
                 while minify(&matrix) >= 2.0 && img.w >= 4 && img.h >= 4 {
-                    img = img.downsample2();
+                    img = Arc::new(img.downsample2());
                     matrix = matrix.then_apply(&Affine::scale(2.0, 2.0));
                 }
                 // With tiny pictures the reference stops minifying: keep its existing path.

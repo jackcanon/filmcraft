@@ -35,3 +35,33 @@ interface update cadence. Neither measurement establishes physical display prese
 sustained playback capacity or support for every camera mode. Camera integration on a separately
 tracked decoder-capable base does not establish decoding support on another source tree. Private
 recordings, projects, derived pictures and captures stay outside the source contribution.
+
+
+The native frame server may also retain the clipped inner working picture across outer-only
+edits. This host-owned cache has two entries and a 64-mebibyte byte limit; job-local staged
+pictures have the same limits. Those are additional bounded pictures, not a total process-memory
+limit. Entries retain immutable images and project metadata, not open media sources. No cache
+lock is held while rendering. Exact sequence time, working scale, effects, depth, source pool and
+generation, catch-up margin and transitive picture dependencies determine reuse. Ordinary paused
+monitor requests have a catch-up margin too; treating every such request as playback would
+incorrectly disable reuse. Draft and speculative prefetch work do not populate this cache.
+
+The renderer's optional provider hooks default to uncached behavior, preserving the reference and
+export paths. Failed-source, pending or cancelled jobs do not publish staged pictures. A completed
+plan must finish upload preparation before publication; a changed source generation discards its
+writes. Oversized or invalid images are not retained. Existing nested clipping, caption, mip,
+border and fallback rules still apply to every new outer placement.
+
+`nested_picture_reuse` requests actual monitor plans from a counted nonuniform generated source.
+Its outer-only regression fails before reuse because a second inner frame is fetched; after reuse,
+the newly positioned outer picture still matches a fresh reference while the inner frame is not
+fetched again. Additional cases cover inner changes, undo/redo, time, resolution, draft quality,
+source/proxy changes, captions and recovery after pending/cancelled work. Internal resource checks
+verify publication boundaries, pool/context isolation, malformed-image rejection and eviction.
+These tests do not replace repeated uninstrumented native performance and real-camera checks.
+
+The frame server owns the completed cache strongly. Idle worker state keeps only a weak reference;
+in-flight jobs may hold it until they finish. Dropping the server therefore releases its completed
+picture snapshots instead of leaving the new cache pinned by detached idle workers. The lifetime
+regression observes the actual project snapshot through a weak reference after dropping the app;
+it fails before this ownership correction. General worker-thread shutdown is outside this change.

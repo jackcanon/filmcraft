@@ -87,7 +87,7 @@ impl ThumbnailRevisions {
     }
 }
 
-fn dependencies_unchanged(old: &Project, new: &Project, root: ItemId) -> bool {
+pub(crate) fn dependencies_unchanged(old: &Project, new: &Project, root: ItemId) -> bool {
     // These assets live outside individual sequence nodes. Conservatively invalidate on a
     // change (and on oversized libraries); their content is not hashed into every thumbnail.
     if old.luts.len() > NODES
