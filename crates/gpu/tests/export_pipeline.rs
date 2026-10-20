@@ -81,6 +81,8 @@ fn export_png(dir: &str, gpu: GpuRendering, (w, h): (u32, u32)) {
     let mut s = ExportSettings {
         format: Format::PngSequence,
         path: std::env::temp_dir().join(format!("fc-gpu-export-{dir}")).to_string_lossy().into_owned(),
+        // The size matrix intentionally replaces its previously generated frames.
+        overwrite: true,
         ..Default::default()
     };
     s.range = Some(TimeRange::new(filmcraft_time::Tick::ZERO, filmcraft_time::FrameRate::FPS_24.tick_of(2)));
