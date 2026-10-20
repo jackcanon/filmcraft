@@ -85,18 +85,32 @@ A file with a `schema_version` newer than the build supports is **refused**, not
 
 Reading it partially and saving it back would silently drop whatever the newer version added.
 
-## Saving is atomic
+## Saving and live project state
 
-Every write of a project file, auto-save, recovery snapshot or preferences file goes through
-`filmcraft_format::atomic_write`:
+Save and Save As stage destination-based project and root-bin names until the write succeeds.
+If a schema-backup or target write fails, the live project, adopted path, dirty state and edit
+history stay unchanged. The serialized successful save and adopted project use the same new name.
+Save a Copy keeps the current name and path. A protective legacy backup that was successfully
+written before a later target failure remains available; saving is not a multi-file rollback.
 
-1. write the bytes to a hidden temp file in the **same directory** (`.<name>.<pid>-<n>.tmp`);
-2. `fsync` the temp file;
-3. rename it over the target (an atomic replace on every supported OS);
-4. `fsync` the directory so the rename itself is durable.
+Generated command regressions: `cargo test --release -p filmcraft-engine --lib save_transaction_`.
+These injected-write tests check live-session state, not native disk-failure cleanup or power-loss
+recovery.
 
-A crash, `kill -9` or power cut at any point leaves either the complete old file or the complete new
-one. If a step fails, the temp file is removed and the old file is untouched.
+The native filesystem host has two write paths:
+
+- Replacement writes (`FsServices::write_file`) and the auto-save, recovery and preferences
+  writers use `filmcraft_format::atomic_write`: write a hidden temporary file in the same directory,
+  sync its contents, rename it over the target, then attempt to sync the directory. If a write,
+  sync or rename fails before replacement completes, cleanup of the temporary file is attempted
+  and the target is not replaced. Directory syncing is best effort; successful return does not
+  certify power-loss durability.
+- New destinations (`FsServices::write_file_new`) use exclusive creation to avoid replacing a
+  concurrently created file, then write and sync the contents. On a write or sync error the host
+  attempts to truncate and sync the reserved file. An empty or incomplete destination may remain;
+  this path does not use atomic replacement.
+
+These file-level limits are separate from adopting a successful save into the live session.
 
 ## Commands
 

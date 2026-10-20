@@ -179,3 +179,158 @@ fn open_demo_project_clears_saved_path_so_save_does_not_overwrite() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A deterministic host failure, without relying on platform-specific permissions.
+#[derive(Default)]
+struct SaveFiles {
+    files: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    fail: std::sync::Mutex<Option<String>>,
+    attempts: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl Services for SaveFiles {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        self.files.lock().unwrap().get(path).cloned().ok_or_else(|| std::io::ErrorKind::NotFound.into())
+    }
+
+    fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.attempts.lock().unwrap().push((path.to_owned(), bytes.to_vec()));
+        if self.fail.lock().unwrap().as_deref() == Some(path) {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected save failure"));
+        }
+        self.files.lock().unwrap().insert(path.to_owned(), bytes.to_vec());
+        Ok(())
+    }
+}
+
+fn save_state(s: &mut Session) -> Value {
+    json!({
+        "project": serde_json::to_value(&*s.project).unwrap(),
+        "path": s.path, "dirty": s.is_dirty(), "revision": s.revision,
+        "savedRevision": s.saved_revision, "schema": s.loaded_schema,
+        "history": s.execute("history.list", json!({})).unwrap(),
+        "preferences": s.prefs.to_value(), "editor": serde_json::to_value(&s.state).unwrap(),
+        "view": serde_json::to_value(s.project_view()).unwrap(), "previews": s.previews.dir(),
+    })
+}
+
+#[test]
+fn save_transaction_failed_destination_preserves_clean_dirty_and_unsaved_sessions() {
+    for command in ["file.saveAs", "file.save"] {
+        for mode in ["clean", "dirty", "never-saved"] {
+            let d = temp_dir(&format!("save-transaction-{command}-{mode}"));
+            let original = d.join("original.fcproj").to_string_lossy().into_owned();
+            let target = d.join("different-name.fcproj").to_string_lossy().into_owned();
+            let files = Arc::new(SaveFiles::default());
+            let mut s = demo();
+            s.services = files.clone();
+            if mode != "never-saved" {
+                s.execute("file.saveAs", json!({"path": original})).unwrap();
+            }
+            if mode == "dirty" {
+                s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+            }
+            // Keep both undo and redo content in the state being protected.
+            s.execute("file.newBin", json!({"name": "redo must survive"})).unwrap();
+            s.execute("edit.undo", json!({})).unwrap();
+            if mode == "clean" {
+                s.execute("file.save", json!({})).unwrap();
+            }
+            let before = save_state(&mut s);
+            let project = s.project.clone();
+            let disk = files.files.lock().unwrap().clone();
+            *files.fail.lock().unwrap() = Some(target.clone());
+            let err = s.execute(command, json!({"path": target})).unwrap_err().to_string();
+            assert!(err.contains("injected save failure"), "{err}");
+            assert_eq!(save_state(&mut s), before, "{command} {mode}");
+            assert!(Arc::ptr_eq(&project, &s.project), "failure must not replace or detach the live project");
+            assert_eq!(*files.files.lock().unwrap(), disk);
+            // The failed bytes were correctly named, even though no live state was adopted.
+            let attempts = files.attempts.lock().unwrap();
+            let staged = filmcraft_format::decode(&attempts.last().unwrap().1).unwrap().project;
+            assert_eq!(staged.name, "different-name");
+            assert_eq!(staged.root.name, "different-name");
+            drop(attempts);
+            *files.fail.lock().unwrap() = None;
+            let history = s.execute("history.list", json!({})).unwrap();
+            s.execute(command, json!({"path": target})).unwrap();
+            assert_eq!(s.project.name, "different-name");
+            assert_eq!(s.project.root.name, "different-name");
+            assert_eq!(s.path.as_deref(), Some(target.as_str()));
+            assert!(!s.is_dirty());
+            assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+            assert_eq!(s.revision, before["revision"].as_u64().unwrap());
+            let bytes = files.read_file(&target).unwrap();
+            assert_eq!(filmcraft_format::decode(&bytes).unwrap().project, *s.project);
+            let mut reopened = Session { services: files.clone(), ..Session::default() };
+            reopened.execute("file.open", json!({"path": target})).unwrap();
+            assert_eq!(*reopened.project, *s.project);
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+#[test]
+fn save_transaction_legacy_backup_and_target_failures_preserve_live_state() {
+    for failure in ["backup", "target"] {
+        let d = temp_dir(&format!("save-transaction-legacy-{failure}"));
+        let path = d.join("legacy.fcproj").to_string_lossy().into_owned();
+        let backup = d.join("legacy (schema v1 backup).fcproj").to_string_lossy().into_owned();
+        let bytes = std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../format/tests/fixtures/v1-edit.fcproj")).unwrap();
+        let files = Arc::new(SaveFiles::default());
+        files.files.lock().unwrap().insert(path.clone(), bytes.clone());
+        let mut s = Session { services: files.clone(), ..Session::default() };
+        s.execute("file.open", json!({"path": path})).unwrap();
+        assert_eq!(s.loaded_schema, 1);
+        s.execute("file.newBin", json!({"name": "unsaved"})).unwrap();
+        let before = save_state(&mut s);
+        let project = s.project.clone();
+        *files.fail.lock().unwrap() = Some(if failure == "backup" { backup.clone() } else { path.clone() });
+        assert!(s.execute("file.save", json!({})).unwrap_err().to_string().contains("injected save failure"));
+        assert_eq!(save_state(&mut s), before, "{failure}");
+        assert!(Arc::ptr_eq(&project, &s.project));
+        assert_eq!(files.read_file(&path).unwrap(), bytes);
+        if failure == "backup" {
+            assert!(files.read_file(&backup).is_err());
+            assert_eq!(files.attempts.lock().unwrap().len(), 1, "target is not attempted after failed backup");
+        } else {
+            assert_eq!(files.read_file(&backup).unwrap(), bytes, "a successful protective backup can remain");
+        }
+        *files.fail.lock().unwrap() = None;
+        s.execute("file.save", json!({})).unwrap();
+        assert_eq!(files.read_file(&backup).unwrap(), bytes);
+        assert_eq!(s.project.name, "legacy");
+        assert_eq!(s.project.root.name, "legacy");
+        assert_eq!(s.loaded_schema, filmcraft_format::SCHEMA_VERSION);
+        assert!(!s.is_dirty());
+        assert_eq!(filmcraft_format::decode(&files.read_file(&path).unwrap()).unwrap().project, *s.project);
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn save_transaction_copy_success_and_failure_never_adopt_destination() {
+    let d = temp_dir("save-transaction-copy");
+    let path = d.join("original.fcproj").to_string_lossy().into_owned();
+    let copy = d.join("copy.fcproj").to_string_lossy().into_owned();
+    let files = Arc::new(SaveFiles::default());
+    let mut s = demo();
+    s.services = files.clone();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let before = save_state(&mut s);
+    let project = s.project.clone();
+    let disk = files.files.lock().unwrap().clone();
+    *files.fail.lock().unwrap() = Some(copy.clone());
+    assert!(s.execute("file.saveCopy", json!({"path": copy})).is_err());
+    assert_eq!(save_state(&mut s), before);
+    assert!(Arc::ptr_eq(&project, &s.project));
+    assert_eq!(*files.files.lock().unwrap(), disk);
+    *files.fail.lock().unwrap() = None;
+    s.execute("file.saveCopy", json!({"path": copy})).unwrap();
+    assert_eq!(save_state(&mut s), before);
+    assert!(Arc::ptr_eq(&project, &s.project));
+    assert_eq!(filmcraft_format::decode(&files.read_file(&copy).unwrap()).unwrap().project, *s.project);
+    assert_eq!(s.project.name, "original");
+    let _ = std::fs::remove_dir_all(d);
+}
